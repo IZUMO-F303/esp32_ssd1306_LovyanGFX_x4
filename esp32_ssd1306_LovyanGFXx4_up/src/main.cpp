@@ -52,9 +52,11 @@ const char* city = "********"; // 都市名で指定  例）Tokyo,jp
 
 // --- タッチスクリーンと省電力設定 ---
 const int touchPin = 33;            // タッチ検出に使用するGPIOピン
+const int motionPin = 14;           // 人感センサに使用するGPIOピン
 const int touchThreshold = 30;      // タッチ検出の閾値 (値が小さいほど敏感)
-unsigned long lastInteractionTime = 0; // 最後の操作（タッチ）時刻
-const unsigned long displayTimeout = 10 * 60 * 1000; // 3分 (ms)
+unsigned long lastInteractionTime = 0; // 最後の操作（タッチまたは人感）時刻
+unsigned long lastMotionCheckTime = 0; // 最後に人感センサをチェックした時刻
+const unsigned long displayTimeout = 5 * 60 * 1000; // 5分 (ms)
 bool isDisplayOff = false;          // ディスプレイが消灯中かどうかのフラグ
 
 // --- スターフィールド設定 ---
@@ -70,6 +72,7 @@ struct Star {
 Star stars[NUM_STARS]; // 星の配列
 
 unsigned long lastGOLUpdate = 0; // マンデルブロから流用 (名前は後で修正するかも)
+unsigned long UpdatestarAdr = 0; // スターフィールドの更新間隔 (ms)
 const unsigned long golUpdateInterval = 50; // スターフィールドの更新間隔 (ms)
 
 // 左側ディスプレイ(0x3C)用の設定
@@ -350,19 +353,6 @@ void updateWeather() {
     Serial.println("updateWeather() finished.");
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 // スターフィールドの星を初期化
 void initStars() {
   for (int i = 0; i < NUM_STARS; i++) {
@@ -552,11 +542,14 @@ void setup() {
     Serial.println("Right display (Bus 1) initialization failed");
     return;
   }
+  
+  pinMode(motionPin, INPUT); // 人感センサのピンを入力に設定
+
   lgfx_left.setBrightness(32); // 明るさ設定(max=255)
   lgfx_right.setBrightness(32); // 明るさ設定(max=255)
   lgfx_left_bus1.setBrightness(32); // 明るさ設定(max=255)
   lgfx_right_bus1.setBrightness(32); // 明るさ設定(max=255)
-
+  
   // WiFi接続
   lgfx_left.clear();
   lgfx_left.setCursor(0, 0);
@@ -604,6 +597,7 @@ void setup() {
   initStars(); // スターフィールドを初期化
 
   lastInteractionTime = millis(); // 最後の操作時刻を初期化
+  lastMotionCheckTime = millis(); // 人感センサの最終チェック時刻を初期化
 }
 
 void loop() {
@@ -612,23 +606,45 @@ void loop() {
   static unsigned long lastWeatherUpdate = 0;
   static int last_day = -1;
   static int last_minute = -1;
+  static int last_moon_age = -1;
   static int last_triangle_x_center = -1;
   static int time_display_bottom_y = 30;
 
-  // --- タッチ入力の検出を最優先 ---
+  // --- タッチ入力の検出と人感センサのチェック ---
   int touchValue = touchRead(touchPin);
+  bool interactionDetected = false;
 
+  // タッチ検出
   if (touchValue < touchThreshold) {
+    interactionDetected = true;
+  }
+
+  // 人感センサ検出 (1秒おき)
+  if (millis() - lastMotionCheckTime > 1000) {
+    lastMotionCheckTime = millis();
+    if (digitalRead(motionPin) == HIGH) {
+      interactionDetected = true;
+      Serial.println("Motion detected!");
+    }
+  }
+
+  if (interactionDetected) {
     lastInteractionTime = millis(); // 最後の操作時刻を更新
 
     if (isDisplayOff) {
       isDisplayOff = false;
+      Serial.println("Waking up from screensaver.");
       
       // ディスプレイを復帰させ、明るさを設定
       lgfx_left.wakeup();
       lgfx_right.wakeup();
       lgfx_left_bus1.wakeup();
       lgfx_right_bus1.wakeup();
+
+      lgfx_left.init(); // 時刻表示の再初期化
+      lgfx_right.init(); // 時刻表示の再初期化
+      lgfx_left_bus1.init(); // 時刻表示の再初期化
+      lgfx_right_bus1.init(); // 時刻表示の再初期化
 
       lgfx_left.setBrightness(32);
       lgfx_right.setBrightness(32);
@@ -649,11 +665,7 @@ void loop() {
       last_minute = -1;
       
       return; // 復帰処理を完了し、次のループサイクルから通常表示を再開
-    } else {
-      //Serial.println("isDisplayOff was FALSE. Ignoring touch (display already on)."); // デバッグ用
     }
-  } else {
-    //Serial.println(" >= Threshold. No touch."); // デバッグ用
   }
 
   // --- モードに応じた処理 ---
@@ -673,6 +685,7 @@ void loop() {
       lgfx_right_bus1.clear();
       
       lastGOLUpdate = millis(); // スターフィールドの初回更新タイミングを設定
+      UpdatestarAdr = millis(); // スターフィールドの開始行リセットタイミングを設定
       return; // 次のループサイクルからスターフィールドを開始
     }
 
@@ -685,25 +698,36 @@ void loop() {
       time_t epochTime = timeClient.getEpochTime();
       struct tm *ptm = localtime(&epochTime);
 
-      // 日付の更新
-      if (last_day == -1 || ptm->tm_mday != last_day) {
+      // 月齢を計算 (四捨五入して整数にする)
+      double currentMoonAge = calculateMoonAge(ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday);
+      int currentMoonAgeInt = (int)(currentMoonAge + 0.5);
+
+      // 日付の更新、または月齢（整数値）の更新
+      if (last_day == -1 || ptm->tm_mday != last_day || currentMoonAgeInt != last_moon_age) {
           displayDateOfWeek();
           last_day = ptm->tm_mday;
+          last_moon_age = currentMoonAgeInt;
       }
       
       // 時刻の更新
       char timeStr[20];
       strftime(timeStr, sizeof(timeStr), "%H:%M", ptm);
       int current_minute = ptm->tm_min;
+      int indicator_offset = 5;
+      int triangle_height = 10;
+      int triangle_base_width = 5;
+
 
       if (current_minute != last_minute) {
           last_minute = current_minute;
-          lgfx_right.clear();
+          //lgfx_right.clear();
           lgfx_right.setCursor(0, 0);
+          lgfx_right.setTextColor(TFT_WHITE, TFT_BLACK); // 白文字、背景は黒
           lgfx_right.setFont(&fonts::Font7);
           lgfx_right.setTextSize(0.9);
           lgfx_right.println(timeStr);
           time_display_bottom_y = lgfx_right.getCursorY();
+
           int indicator_offset = 5;
           int indicator_start_y = time_display_bottom_y + indicator_offset;
           int line_y = indicator_start_y - 2;
@@ -715,11 +739,14 @@ void loop() {
           lgfx_right.drawFastVLine(start_x + effective_width / 4, vline_y_start, vline_height, TFT_WHITE);
           lgfx_right.drawFastVLine(start_x + effective_width / 2, vline_y_start, vline_height, TFT_WHITE);
           lgfx_right.drawFastVLine(start_x + effective_width * 3 / 4, vline_y_start, vline_height, TFT_WHITE);
+          //int triangle_base_width = 5;
+          //int triangle_height = 10;
+          lgfx_right.fillTriangle(last_triangle_x_center, indicator_start_y, last_triangle_x_center - triangle_base_width / 2, indicator_start_y + triangle_height, last_triangle_x_center + triangle_base_width / 2, indicator_start_y + triangle_height, TFT_BLACK);
       } else {
           if (last_triangle_x_center != -1) {
-              int indicator_offset = 5;
-              int triangle_height = 10;
-              int triangle_base_width = 5;
+              //int indicator_offset = 5;
+              //int triangle_height = 10;
+              //int triangle_base_width = 5;
               int indicator_start_y = time_display_bottom_y + indicator_offset;
               lgfx_right.fillTriangle(last_triangle_x_center, indicator_start_y, last_triangle_x_center - triangle_base_width / 2, indicator_start_y + triangle_height, last_triangle_x_center + triangle_base_width / 2, indicator_start_y + triangle_height, TFT_BLACK);
           }
@@ -727,9 +754,9 @@ void loop() {
 
       int sec = ptm->tm_sec;
       int display_width = lgfx_right.width();
-      int indicator_offset = 5;
-      int triangle_height = 10;
-      int triangle_base_width = 5;
+      //int indicator_offset = 5;
+      //int triangle_height = 10;
+      //int triangle_base_width = 5;
       int indicator_start_y = time_display_bottom_y + indicator_offset;
       float x_center_float = (float)sec / 59.0f * (display_width - 8);
       int x_center = round(x_center_float + 4);
@@ -748,6 +775,21 @@ void loop() {
     if (millis() - lastGOLUpdate > golUpdateInterval) {
       lastGOLUpdate = millis();
       drawStarfield(); // スターフィールドを描画
+      if(millis() - UpdatestarAdr >10000 ) { // 10秒ごとに開始行をリセットして描画の乱れを防止
+        UpdatestarAdr = millis();
+        lgfx_right.startWrite();       // 通信開始を宣言
+        lgfx_right.writeCommand(0x40); // 開始行を0にリセット
+        lgfx_right.endWrite();         // 通信終了を宣言
+        lgfx_left.startWrite();       // 通信開始を宣言
+        lgfx_left.writeCommand(0x40); // 開始行を0にリセット
+        lgfx_left.endWrite();         // 通信終了を宣言
+        lgfx_left_bus1.startWrite();       // 通信開始を宣言
+        lgfx_left_bus1.writeCommand(0x40); // 開始行を0にリセット
+        lgfx_left_bus1.endWrite();         // 通信終了を宣言
+        lgfx_right_bus1.startWrite();       // 通信開始を宣言
+        lgfx_right_bus1.writeCommand(0x40); // 開始行を0にリセット
+        lgfx_right_bus1.endWrite();         // 通信終了を宣言
+      }
     }
   }
 }
